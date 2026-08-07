@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex Setup",
+  "productName": "Codex Installer",
   "version": "0.1.0",
   "identifier": "work.llmfree.codex-installer",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Codex 安装助手",
+        "title": "Codex Installer - 安装助手",
         "width": 1280,
         "height": 900,
         "minWidth": 1100,
@@ -29,10 +29,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "languages": ["SimpChinese"]
       }
     }
   }

@@ -61,6 +61,25 @@ type InstallResult = {
   installDirectory: string;
 };
 
+type AppUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  available: boolean;
+  releaseNotes: string;
+  releaseUrl: string;
+  assetName: string;
+  downloadUrl: string;
+  digest: string | null;
+};
+
+type AppUpdateProgress = {
+  percent: number;
+  downloaded: number;
+  total: number;
+};
+
+type AppUpdateStatus = "idle" | "checking" | "current" | "available" | "downloading" | "installing" | "error";
+
 const QQ_NUMBER = "751077517";
 const LLMFREE_URL = "https://www.llmfree.work";
 
@@ -139,7 +158,15 @@ function App() {
   const [installResult, setInstallResult] = useState<InstallResult | null>(null);
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
+  const [copyDialog, setCopyDialog] = useState<string | null>(null);
+  const [copyingQq, setCopyingQq] = useState(false);
   const [tutorial, setTutorial] = useState<Companion | null>(null);
+  const [launchingTarget, setLaunchingTarget] = useState<string | null>(null);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus>("idle");
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateError, setUpdateError] = useState("");
   const installationAttempt = useRef(0);
 
   const recordActivity = (item: ProgressEvent) => {
@@ -162,6 +189,21 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let active = true;
+    void invoke<AppUpdateInfo>("check_app_update")
+      .then((info) => {
+        if (!active) return;
+        setUpdateInfo(info);
+        setUpdateStatus(info.available ? "available" : "current");
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const openExternal = async (url: string) => {
     if (isTauriRuntime()) {
       await invoke("open_external", { url });
@@ -170,21 +212,29 @@ function App() {
     }
   };
 
-  const copyQq = async () => {
-    try {
-      if (isTauriRuntime()) {
-        await invoke("copy_qq");
-      } else {
-        await navigator.clipboard.writeText(QQ_NUMBER);
+  const copyQq = () => {
+    setCopyDialog(`正在复制客服 QQ ${QQ_NUMBER}...`);
+    setCopyingQq(true);
+    void (async () => {
+      try {
+        if (isTauriRuntime()) {
+          await invoke("copy_qq");
+        } else {
+          await navigator.clipboard.writeText(QQ_NUMBER);
+        }
+        setCopyDialog(`客服 QQ ${QQ_NUMBER} 已复制，可以直接粘贴到 QQ 搜索。`);
+      } catch {
+        await navigator.clipboard.writeText(QQ_NUMBER).catch(() => undefined);
+        setCopyDialog(`自动复制未完成，请手动复制 QQ：${QQ_NUMBER}`);
+      } finally {
+        setCopyingQq(false);
       }
-      setToast("QQ 号已复制，可以直接粘贴到 QQ 搜索");
-    } catch {
-      await navigator.clipboard.writeText(QQ_NUMBER).catch(() => undefined);
-      setToast("QQ 号已复制");
-    }
+    })();
   };
 
   const launchInstalledApp = async (target: string, label: string) => {
+    if (launchingTarget) return;
+    setLaunchingTarget(target);
     try {
       if (!isTauriRuntime()) {
         setToast(`请在桌面版中启动 ${label}`);
@@ -194,6 +244,49 @@ function App() {
       setToast(`正在启动 ${label}`);
     } catch (caught) {
       setToast(typeof caught === "string" ? caught : `无法启动 ${label}`);
+    } finally {
+      setLaunchingTarget(null);
+    }
+  };
+
+  const checkForUpdates = async () => {
+    setUpdateDialogOpen(true);
+    setUpdateStatus("checking");
+    setUpdateError("");
+    setUpdateProgress(0);
+    if (!isTauriRuntime()) {
+      setUpdateStatus("error");
+      setUpdateError("请在安装后的 Windows 桌面版中检查更新。");
+      return;
+    }
+    try {
+      const info = await invoke<AppUpdateInfo>("check_app_update");
+      setUpdateInfo(info);
+      setUpdateStatus(info.available ? "available" : "current");
+    } catch (caught) {
+      setUpdateStatus("error");
+      setUpdateError(typeof caught === "string" ? caught : "暂时无法检查更新，请稍后重试。");
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!updateInfo?.available || updateStatus === "downloading") return;
+    setUpdateStatus("downloading");
+    setUpdateProgress(0);
+    setUpdateError("");
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await listen<AppUpdateProgress>("app-update-progress", ({ payload }) => {
+        setUpdateProgress(payload.percent);
+      });
+      await invoke("install_app_update");
+      setUpdateProgress(100);
+      setUpdateStatus("installing");
+    } catch (caught) {
+      setUpdateStatus("error");
+      setUpdateError(typeof caught === "string" ? caught : "更新没有完成，请稍后重试。");
+    } finally {
+      unlisten?.();
     }
   };
 
@@ -274,7 +367,7 @@ function App() {
         <div className="brand-lockup">
           <div className="brand-mark"><Code2 size={22} strokeWidth={2.2} /></div>
           <div>
-            <strong>Codex Setup</strong>
+            <strong>Codex Installer</strong>
             <span>Windows 安装助手</span>
           </div>
         </div>
@@ -304,13 +397,21 @@ function App() {
       <main className="workspace">
         <header className="support-bar">
           <div className="support-contact">
-            <Headphones size={17} />
-            <span>安装遇到问题？</span>
-            <button className="support-copy" onClick={copyQq} title="点击复制 QQ 号">
-              <Copy size={15} /> QQ {QQ_NUMBER}
+            <button className="support-copy" onClick={copyQq} title="点击复制客服 QQ 号">
+              <Headphones size={17} /> 安装遇到问题？
             </button>
           </div>
-          <span className="support-assurance"><ShieldCheck size={15} /> 官方上游下载</span>
+          <div className="support-tools">
+            <button
+              className={`update-button ${updateStatus === "available" ? "available" : ""}`}
+              onClick={checkForUpdates}
+              disabled={updateStatus === "checking" || updateStatus === "downloading" || updateStatus === "installing"}
+            >
+              {updateStatus === "checking" ? <LoaderCircle className="button-spinner" size={15} /> : updateStatus === "available" ? <Download size={15} /> : <RefreshCw size={15} />}
+              {updateStatus === "available" && updateInfo ? `发现 v${updateInfo.latestVersion}` : "检查更新"}
+            </button>
+            <span className="support-assurance"><ShieldCheck size={15} /> 官方上游下载</span>
+          </div>
         </header>
 
         {screen === "choose" && (
@@ -429,7 +530,7 @@ function App() {
             <p className="lead">{error}</p>
             <div className="error-detail">
               <Wrench size={20} />
-              <div><strong>需要协助？</strong><span>点击左上角 QQ 联系我们，并把此处错误信息一并发来。</span></div>
+              <div><strong>需要协助？</strong><span>点击左上角“安装遇到问题？”复制客服 QQ，并把此处错误信息一并发来。</span></div>
             </div>
             <div className="result-actions">
               <button className="secondary-button" onClick={() => setScreen("choose")}><ArrowLeft size={17} /> 返回选择</button>
@@ -466,20 +567,40 @@ function App() {
                 </button>
                 {companion === "codex-plus-plus" ? (
                   <>
-                    <button className="secondary-button" onClick={() => launchInstalledApp("codex-plus-plus-manager", "Codex++ 管理工具")}>
-                      <Settings2 size={17} /> Codex++ 管理工具
+                    <button
+                      className="secondary-button launch-button"
+                      disabled={launchingTarget !== null}
+                      onClick={() => launchInstalledApp("codex-plus-plus-manager", "Codex++ 管理工具")}
+                    >
+                      {launchingTarget === "codex-plus-plus-manager" ? <LoaderCircle className="button-spinner" size={17} /> : <Settings2 size={17} />}
+                      {launchingTarget === "codex-plus-plus-manager" ? "正在启动..." : "Codex++ 管理工具"}
                     </button>
-                    <button className="primary-button" onClick={() => launchInstalledApp("codex-plus-plus", "Codex++")}>
-                      <Play size={17} /> 启动 Codex++
+                    <button
+                      className="primary-button launch-button"
+                      disabled={launchingTarget !== null}
+                      onClick={() => launchInstalledApp("codex-plus-plus", "Codex++")}
+                    >
+                      {launchingTarget === "codex-plus-plus" ? <LoaderCircle className="button-spinner" size={17} /> : <Play size={17} />}
+                      {launchingTarget === "codex-plus-plus" ? "正在启动..." : "启动 Codex++"}
                     </button>
                   </>
                 ) : (
                   <>
-                    <button className="primary-button" onClick={() => launchInstalledApp("cc-switch", "CC Switch")}>
-                      <Play size={17} /> 启动 CC Switch
+                    <button
+                      className="primary-button launch-button"
+                      disabled={launchingTarget !== null}
+                      onClick={() => launchInstalledApp("cc-switch", "CC Switch")}
+                    >
+                      {launchingTarget === "cc-switch" ? <LoaderCircle className="button-spinner" size={17} /> : <Play size={17} />}
+                      {launchingTarget === "cc-switch" ? "正在启动..." : "启动 CC Switch"}
                     </button>
-                    <button className="secondary-button" onClick={() => launchInstalledApp("codex", "Codex")}>
-                      <TerminalSquare size={17} /> 启动 Codex
+                    <button
+                      className="secondary-button launch-button"
+                      disabled={launchingTarget !== null}
+                      onClick={() => launchInstalledApp("codex", "Codex")}
+                    >
+                      {launchingTarget === "codex" ? <LoaderCircle className="button-spinner" size={17} /> : <TerminalSquare size={17} />}
+                      {launchingTarget === "codex" ? "正在启动..." : "启动 Codex"}
                     </button>
                   </>
                 )}
@@ -510,7 +631,103 @@ function App() {
       </main>
 
       {toast && <div className="toast"><CheckCircle2 size={17} /> {toast}</div>}
+      {copyDialog && (
+        <div className="modal-backdrop copy-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !copyingQq && setCopyDialog(null)}>
+          <section className="copy-dialog" role="dialog" aria-modal="true" aria-labelledby="copy-dialog-title">
+            <div className="copy-dialog-icon">
+              {copyingQq ? <LoaderCircle className="button-spinner" size={22} /> : <CheckCircle2 size={22} />}
+            </div>
+            <div className="copy-dialog-content">
+              <h2 id="copy-dialog-title">安装遇到问题？</h2>
+              <p>{copyDialog}</p>
+            </div>
+            <button className="primary-button" disabled={copyingQq} onClick={() => setCopyDialog(null)}>
+              {copyingQq ? <LoaderCircle className="button-spinner" size={17} /> : <Check size={17} />} {copyingQq ? "正在复制..." : "知道了"}
+            </button>
+          </section>
+        </div>
+      )}
+      {updateDialogOpen && (
+        <UpdateDialog
+          info={updateInfo}
+          status={updateStatus}
+          progress={updateProgress}
+          error={updateError}
+          onClose={() => setUpdateDialogOpen(false)}
+          onCheck={checkForUpdates}
+          onInstall={installUpdate}
+          onOpenRelease={() => updateInfo?.releaseUrl && openExternal(updateInfo.releaseUrl)}
+        />
+      )}
       {tutorial && <TutorialModal tool={tutorial} onToolChange={setTutorial} onClose={() => setTutorial(null)} />}
+    </div>
+  );
+}
+
+function UpdateDialog({
+  info,
+  status,
+  progress,
+  error,
+  onClose,
+  onCheck,
+  onInstall,
+  onOpenRelease,
+}: {
+  info: AppUpdateInfo | null;
+  status: AppUpdateStatus;
+  progress: number;
+  error: string;
+  onClose: () => void;
+  onCheck: () => void;
+  onInstall: () => void;
+  onOpenRelease: () => void;
+}) {
+  const busy = status === "checking" || status === "downloading" || status === "installing";
+  return (
+    <div className="modal-backdrop update-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
+      <section className="update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
+        <div className="update-dialog-header">
+          <div>
+            <span>Codex Installer</span>
+            <h2 id="update-dialog-title">版本更新</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} disabled={busy} title="关闭"><X size={19} /></button>
+        </div>
+
+        {status === "checking" && (
+          <div className="update-state centered"><LoaderCircle className="button-spinner" size={30} /><strong>正在检查新版本</strong><span>正在连接本项目的 GitHub Release。</span></div>
+        )}
+
+        {status === "current" && info && (
+          <div className="update-state centered"><CheckCircle2 size={32} /><strong>已经是最新版本</strong><span>当前版本 v{info.currentVersion}</span></div>
+        )}
+
+        {(status === "available" || status === "downloading" || status === "installing") && info && (
+          <div className="update-state">
+            <div className="version-route"><span>v{info.currentVersion}</span><ArrowRight size={18} /><strong>v{info.latestVersion}</strong></div>
+            <p className="update-summary">发现新版本。安装包只会从本项目的 GitHub Release 下载。</p>
+            {info.releaseNotes && <div className="release-notes">{info.releaseNotes}</div>}
+            {(status === "downloading" || status === "installing") && (
+              <div className="update-download">
+                <div><span>{status === "installing" ? "正在启动新版安装程序" : "正在下载更新"}</span><strong>{progress}%</strong></div>
+                <div className="update-progress-track"><span style={{ width: `${progress}%` }} /></div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {status === "error" && (
+          <div className="update-state centered error"><XCircle size={32} /><strong>暂时无法完成更新</strong><span>{error}</span></div>
+        )}
+
+        <div className="update-dialog-actions">
+          {info?.releaseUrl && <button className="secondary-button" onClick={onOpenRelease} disabled={busy}>查看发布页 <ExternalLink size={16} /></button>}
+          {status === "available" && <button className="primary-button" onClick={onInstall}><Download size={17} /> 下载并安装</button>}
+          {status === "error" && <button className="primary-button" onClick={onCheck}><RefreshCw size={17} /> 重新检查</button>}
+          {status === "current" && <button className="primary-button" onClick={onClose}><Check size={17} /> 知道了</button>}
+        </div>
+      </section>
     </div>
   );
 }

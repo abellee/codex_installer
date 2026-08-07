@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,13 @@ const CODEX_DESKTOP_ARM64_URL: &str =
     "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-arm64.msix";
 const CODEX_PLUSPLUS_REPO: &str = "BigPizzaV3/CodexPlusPlus";
 const CC_SWITCH_REPO: &str = "farion1231/cc-switch";
+const APP_REPO: &str = "abellee/codex_installer";
+const CODEX_PLUSPLUS_UPDATE_URL: &str =
+    "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
+const CC_SWITCH_UPDATE_URL: &str =
+    "https://github.com/farion1231/cc-switch/releases/latest/download/latest.json";
+const VC_REDIST_X64_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+const VC_REDIST_ARM64_URL: &str = "https://aka.ms/vs/17/release/vc_redist.arm64.exe";
 const QQ_NUMBER: &str = "751077517";
 
 #[derive(Debug, Deserialize)]
@@ -50,8 +59,47 @@ struct ProgressPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct Release {
+struct AppRelease {
     tag_name: String,
+    #[serde(default)]
+    body: String,
+    html_url: String,
+    assets: Vec<AppReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInfo {
+    current_version: String,
+    latest_version: String,
+    available: bool,
+    release_notes: String,
+    release_url: String,
+    asset_name: String,
+    download_url: String,
+    digest: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateProgress {
+    percent: u8,
+    downloaded: u64,
+    total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Release {
+    #[serde(rename = "tag_name")]
+    _tag_name: String,
     assets: Vec<ReleaseAsset>,
 }
 
@@ -61,6 +109,29 @@ struct ReleaseAsset {
     browser_download_url: String,
     #[serde(default)]
     digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishedAsset {
+    name: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexPlusPlusUpdate {
+    version: String,
+    assets: Vec<PublishedAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishedPlatform {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcSwitchUpdate {
+    version: String,
+    platforms: HashMap<String, PublishedPlatform>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,13 +194,215 @@ async fn latest_release(client: &Client, repo: &str) -> Result<Release> {
         .context("解析上游版本信息失败")
 }
 
-fn is_windows_asset(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    (lower.contains("windows") || lower.contains("win") || lower.contains("pc-windows"))
-        && (lower.contains("x64")
-            || lower.contains("x86_64")
-            || lower.contains("amd64")
-            || lower.contains("win64"))
+fn choose_app_update_asset(
+    release: &AppRelease,
+    architecture: &str,
+) -> Result<AppReleaseAsset> {
+    let selected = release
+        .assets
+        .iter()
+        .filter(|asset| {
+            let lower = asset.name.to_ascii_lowercase();
+            let is_installer = lower.ends_with(".exe")
+                && !lower.contains("uninstall")
+                && !lower.contains("portable");
+            let matches_architecture = match architecture {
+                "x86_64" => {
+                    (lower.contains("x64")
+                        || lower.contains("x86_64")
+                        || lower.contains("win64"))
+                        && !lower.contains("arm64")
+                        && !lower.contains("aarch64")
+                }
+                "aarch64" => lower.contains("arm64") || lower.contains("aarch64"),
+                _ => false,
+            };
+            is_installer && matches_architecture
+        })
+        .max_by_key(|asset| {
+            let lower = asset.name.to_ascii_lowercase();
+            (
+                lower.contains("setup") as u8,
+                lower.contains("installer") as u8,
+            )
+        })
+        .ok_or_else(|| anyhow!("最新版本中没有适用于 {architecture} Windows 的安装包"))?;
+    Ok(AppReleaseAsset {
+        name: selected.name.clone(),
+        browser_download_url: selected.browser_download_url.clone(),
+        digest: selected.digest.clone(),
+    })
+}
+
+fn is_newer_version(current: &str, latest_tag: &str) -> Result<bool> {
+    let current_version = Version::parse(current).context("当前应用版本号格式无效")?;
+    let latest_text = latest_tag.trim_start_matches(['v', 'V']);
+    let latest_version = Version::parse(latest_text)
+        .with_context(|| format!("Release 版本号格式无效：{latest_tag}"))?;
+    Ok(latest_version > current_version)
+}
+
+fn current_app_update() -> AppUpdateInfo {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    AppUpdateInfo {
+        current_version: version.clone(),
+        latest_version: version,
+        available: false,
+        release_notes: String::new(),
+        release_url: String::new(),
+        asset_name: String::new(),
+        download_url: String::new(),
+        digest: None,
+    }
+}
+
+async fn fetch_app_update() -> Result<AppUpdateInfo> {
+    let client = Client::builder()
+        .user_agent(format!("codex-installer/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("无法初始化更新服务")?;
+    let response = client
+        .get(format!(
+            "https://api.github.com/repos/{APP_REPO}/releases/latest"
+        ))
+        .send()
+        .await
+        .context("无法连接 GitHub 更新服务")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(current_app_update());
+    }
+    let release = response
+        .error_for_status()
+        .context("GitHub 更新服务返回异常")?
+        .json::<AppRelease>()
+        .await
+        .context("解析版本信息失败")?;
+
+    let current_version_text = env!("CARGO_PKG_VERSION");
+    let latest_version_text = release
+        .tag_name
+        .trim_start_matches(['v', 'V']);
+    let latest_version = Version::parse(latest_version_text)
+        .with_context(|| format!("Release 版本号格式无效：{}", release.tag_name))?;
+    let available = is_newer_version(current_version_text, &release.tag_name)?;
+    let asset = if available {
+        Some(choose_app_update_asset(&release, std::env::consts::ARCH)?)
+    } else {
+        None
+    };
+
+    Ok(AppUpdateInfo {
+        current_version: current_version_text.to_string(),
+        latest_version: latest_version.to_string(),
+        available,
+        release_notes: release.body,
+        release_url: release.html_url,
+        asset_name: asset.as_ref().map(|item| item.name.clone()).unwrap_or_default(),
+        download_url: asset
+            .as_ref()
+            .map(|item| item.browser_download_url.clone())
+            .unwrap_or_default(),
+        digest: asset.and_then(|item| item.digest),
+    })
+}
+
+#[tauri::command]
+async fn check_app_update() -> Result<AppUpdateInfo, String> {
+    fetch_app_update().await.map_err(|error| error.to_string())
+}
+
+fn verify_sha256(path: &Path, digest: &str) -> Result<()> {
+    let Some(expected) = digest.strip_prefix("sha256:") else {
+        return Ok(());
+    };
+    let mut verify_file = File::open(path).context("无法读取下载文件")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = verify_file.read(&mut buffer).context("校验下载文件失败")?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(anyhow!("下载校验失败，文件可能已损坏"))
+    }
+}
+
+async fn perform_app_update(app: &AppHandle) -> Result<()> {
+    let update = fetch_app_update().await?;
+    if !update.available {
+        return Err(anyhow!("当前已经是最新版本"));
+    }
+    let expected_prefix = format!("https://github.com/{APP_REPO}/releases/download/");
+    if !update.download_url.starts_with(&expected_prefix) {
+        return Err(anyhow!("更新下载地址不属于本项目的 GitHub Release"));
+    }
+
+    let client = Client::builder()
+        .user_agent(format!("codex-installer/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("无法初始化更新下载服务")?;
+    let response = client
+        .get(&update.download_url)
+        .send()
+        .await
+        .context("更新下载请求失败")?
+        .error_for_status()
+        .context("GitHub 拒绝了更新下载请求")?;
+    let total = response.content_length().unwrap_or(0);
+    let update_dir = std::env::temp_dir().join("CodexInstaller").join("updates");
+    fs::create_dir_all(&update_dir).context("无法创建更新缓存目录")?;
+    let safe_name = Path::new(&update.asset_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
+        .ok_or_else(|| anyhow!("更新安装包名称无效"))?;
+    let destination = update_dir.join(safe_name);
+    let mut file = File::create(&destination).context("无法创建更新安装包")?;
+    let mut stream = response.bytes_stream();
+    let mut downloaded = 0_u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("下载更新时连接中断")?;
+        file.write_all(&chunk).context("写入更新安装包失败")?;
+        downloaded += chunk.len() as u64;
+        let percent = downloaded
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(100) as u8;
+        let _ = app.emit(
+            "app-update-progress",
+            AppUpdateProgress {
+                percent,
+                downloaded,
+                total,
+            },
+        );
+    }
+    file.flush().context("刷新更新安装包失败")?;
+    drop(file);
+    if let Some(digest) = &update.digest {
+        verify_sha256(&destination, digest)?;
+    }
+
+    Command::new(&destination)
+        .spawn()
+        .context("无法启动新版安装程序")?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+async fn install_app_update(app: AppHandle) -> Result<(), String> {
+    perform_app_update(&app)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn codex_desktop_asset() -> Result<ReleaseAsset> {
@@ -145,35 +418,127 @@ fn codex_desktop_asset() -> Result<ReleaseAsset> {
     })
 }
 
-fn choose_companion_asset(release: &Release, name: &str) -> Result<ReleaseAsset> {
-    release
+fn release_asset_with_digest(
+    release: &Release,
+    name: String,
+    browser_download_url: String,
+) -> ReleaseAsset {
+    let digest = release
+        .assets
+        .iter()
+        .find(|asset| asset.browser_download_url == browser_download_url || asset.name == name)
+        .and_then(|asset| asset.digest.clone());
+    ReleaseAsset {
+        name,
+        browser_download_url,
+        digest,
+    }
+}
+
+fn choose_codex_plus_plus_asset(
+    update: &CodexPlusPlusUpdate,
+    release: &Release,
+    architecture: &str,
+) -> Result<ReleaseAsset> {
+    let selected = update
         .assets
         .iter()
         .filter(|asset| {
-            let lower = asset.name.to_ascii_lowercase();
-            is_windows_asset(&asset.name)
-                && (lower.ends_with(".exe") || lower.ends_with(".msi"))
-                && !lower.contains("portable")
-                && !lower.contains("debug")
-                && !lower.contains("source")
+            let lower = format!("{} {}", asset.name, asset.url).to_ascii_lowercase();
+            let is_installer = lower.ends_with(".exe") || lower.ends_with(".msi");
+            let is_other_platform =
+                lower.contains("macos") || lower.contains("darwin") || lower.contains("linux");
+            let matches_architecture = match architecture {
+                "x86_64" => !lower.contains("arm64") && !lower.contains("aarch64"),
+                "aarch64" => lower.contains("arm64") || lower.contains("aarch64"),
+                _ => false,
+            };
+            is_installer && !is_other_platform && matches_architecture
         })
         .max_by_key(|asset| {
-            let lower = asset.name.to_ascii_lowercase();
+            let lower = format!("{} {}", asset.name, asset.url).to_ascii_lowercase();
             (
                 lower.contains("setup") as u8,
                 lower.contains("installer") as u8,
                 lower.ends_with(".exe") as u8,
             )
         })
-        .cloned()
         .ok_or_else(|| {
             anyhow!(
-                "{name} 的最新版本中没有找到 Windows x64 安装文件（{}）",
-                release.tag_name
+                "Codex++ 官方更新清单中没有适用于 {architecture} Windows 的安装文件（{}）",
+                update.version
             )
-        })
+        })?;
+    Ok(release_asset_with_digest(
+        release,
+        selected.name.clone(),
+        selected.url.clone(),
+    ))
 }
 
+fn choose_cc_switch_asset(
+    update: &CcSwitchUpdate,
+    release: &Release,
+    architecture: &str,
+) -> Result<ReleaseAsset> {
+    let platform = match architecture {
+        "x86_64" => "windows-x86_64",
+        "aarch64" => "windows-aarch64",
+        _ => return Err(anyhow!("CC Switch 暂不支持当前架构：{architecture}")),
+    };
+    let published = update.platforms.get(platform).ok_or_else(|| {
+        anyhow!(
+            "CC Switch 官方更新清单中没有 {platform} 安装文件（{}）",
+            update.version
+        )
+    })?;
+    let name = reqwest::Url::parse(&published.url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .map(str::to_string)
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "CC-Switch-Windows.msi".to_string());
+    Ok(release_asset_with_digest(
+        release,
+        name,
+        published.url.clone(),
+    ))
+}
+
+async fn latest_companion_asset(client: &Client, companion: &str) -> Result<ReleaseAsset> {
+    let (repo, update_url) = if companion == "cc-switch" {
+        (CC_SWITCH_REPO, CC_SWITCH_UPDATE_URL)
+    } else {
+        (CODEX_PLUSPLUS_REPO, CODEX_PLUSPLUS_UPDATE_URL)
+    };
+    let release = latest_release(client, repo).await?;
+    let response = client
+        .get(update_url)
+        .send()
+        .await
+        .with_context(|| format!("无法获取 {repo} 官方更新清单"))?
+        .error_for_status()
+        .with_context(|| format!("{repo} 官方更新清单不可用"))?;
+
+    if companion == "cc-switch" {
+        let update = response
+            .json::<CcSwitchUpdate>()
+            .await
+            .context("解析 CC Switch 官方更新清单失败")?;
+        choose_cc_switch_asset(&update, &release, std::env::consts::ARCH)
+    } else {
+        let update = response
+            .json::<CodexPlusPlusUpdate>()
+            .await
+            .context("解析 Codex++ 官方更新清单失败")?;
+        choose_codex_plus_plus_asset(&update, &release, std::env::consts::ARCH)
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::manual_checked_ops)]
 async fn download_asset(
     app: &AppHandle,
     control: &InstallControl,
@@ -322,19 +687,27 @@ async fn install_release_installer(
         component,
     );
     let lower = path.to_string_lossy().to_ascii_lowercase();
-    let mut command = if lower.ends_with(".msi") {
-        let mut cmd = Command::new("msiexec.exe");
-        cmd.args(["/i", &path.to_string_lossy(), "/qn", "/norestart"]);
-        cmd
+    let elevated_script = if lower.ends_with(".msi") {
+        "$arguments = @('/i', ('\"' + $env:CODEX_COMPANION_INSTALLER + '\"'), '/qn', '/norestart'); $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $arguments -Verb RunAs -PassThru -Wait; exit $process.ExitCode"
     } else {
-        let mut cmd = Command::new(path);
-        cmd.arg("/S");
-        cmd
+        "$process = Start-Process -FilePath $env:CODEX_COMPANION_INSTALLER -ArgumentList '/S' -Verb RunAs -PassThru -Wait; exit $process.ExitCode"
     };
-    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            elevated_script,
+        ])
+        .env("CODEX_COMPANION_INSTALLER", path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child = command
         .spawn()
-        .with_context(|| format!("无法启动 {component} 安装程序"))?;
+        .map_err(|error| anyhow!("无法启动 {component} 安装程序：{error}"))?;
     let mut current = 80_u8;
     loop {
         if ensure_active(control, run_id).is_err() {
@@ -360,6 +733,76 @@ async fn install_release_installer(
         tokio::time::sleep(std::time::Duration::from_millis(420)).await;
     }
     Ok(())
+}
+
+async fn install_visual_cpp_runtime(
+    app: &AppHandle,
+    control: &InstallControl,
+    run_id: u64,
+    path: &Path,
+) -> Result<()> {
+    ensure_active(control, run_id)?;
+    emit_progress(
+        app,
+        run_id,
+        61,
+        "install",
+        "正在安装 Microsoft Visual C++ 运行库",
+        "这是 Codex++ 和 CC Switch 运行所需的系统组件",
+        "系统依赖",
+    );
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$process = Start-Process -FilePath $env:VC_REDIST_INSTALLER -ArgumentList @('/install', '/quiet', '/norestart') -Verb RunAs -PassThru -Wait; exit $process.ExitCode",
+        ])
+        .env("VC_REDIST_INSTALLER", path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| anyhow!("无法启动 Microsoft Visual C++ 运行库安装程序：{error}"))?;
+    let mut current = 61_u8;
+    loop {
+        if ensure_active(control, run_id).is_err() {
+            let _ = child.kill();
+            return Err(anyhow!("安装任务已取消"));
+        }
+        if let Some(status) = child.try_wait().context("读取 Visual C++ 安装状态失败")? {
+            if !status.success() {
+                return Err(anyhow!(
+                    "Microsoft Visual C++ 运行库安装程序返回错误（{status}）"
+                ));
+            }
+            break;
+        }
+        current = (current + 1).min(62);
+        emit_progress(
+            app,
+            run_id,
+            current,
+            "install",
+            "正在安装 Microsoft Visual C++ 运行库",
+            "Windows 正在注册运行时组件",
+            "系统依赖",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(420)).await;
+    }
+    for _ in 0..20 {
+        if visual_cpp_runtime_installed() {
+            return Ok(());
+        }
+        ensure_active(control, run_id)?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(anyhow!(
+        "Microsoft Visual C++ 运行库安装程序已退出，但 VCRUNTIME140.dll / VCRUNTIME140_1.dll 验证没有通过；请在权限提示中选择“是”后重试"
+    ))
 }
 
 fn codex_desktop_common_candidates() -> Vec<PathBuf> {
@@ -472,6 +915,51 @@ fn companion_is_installed(companion: &str) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn visual_cpp_runtime_installed() -> bool {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let subkey = match std::env::consts::ARCH {
+        "aarch64" => "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\ARM64",
+        _ => "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
+    };
+    let registry_installed = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(subkey)
+        .ok()
+        .and_then(|key: RegKey| key.get_value::<u32, _>("Installed").ok())
+        .is_some_and(|installed| installed == 1);
+    let Some(windows_dir) = std::env::var_os("WINDIR") else {
+        return false;
+    };
+    let system_directory = PathBuf::from(windows_dir).join("System32");
+    registry_installed
+        && system_directory.join("VCRUNTIME140.dll").is_file()
+        && system_directory.join("VCRUNTIME140_1.dll").is_file()
+}
+
+#[cfg(not(windows))]
+fn visual_cpp_runtime_installed() -> bool {
+    true
+}
+
+fn visual_cpp_runtime_asset() -> Result<ReleaseAsset> {
+    let (name, url) = match std::env::consts::ARCH {
+        "x86_64" => ("vc_redist.x64.exe", VC_REDIST_X64_URL),
+        "aarch64" => ("vc_redist.arm64.exe", VC_REDIST_ARM64_URL),
+        architecture => {
+            return Err(anyhow!(
+                "Microsoft Visual C++ 运行库暂不支持当前架构：{architecture}"
+            ))
+        }
+    };
+    Ok(ReleaseAsset {
+        name: name.to_string(),
+        browser_download_url: url.to_string(),
+        digest: None,
+    })
+}
+
 async fn perform_installation(
     app: &AppHandle,
     control: &InstallControl,
@@ -482,11 +970,6 @@ async fn perform_installation(
     let companion_name = match request.companion.as_str() {
         "cc-switch" => "CC Switch",
         _ => "Codex++",
-    };
-    let companion_repo = if request.companion == "cc-switch" {
-        CC_SWITCH_REPO
-    } else {
-        CODEX_PLUSPLUS_REPO
     };
     let client = Client::builder()
         .user_agent("codex-installer/0.1")
@@ -522,7 +1005,7 @@ async fn perform_installation(
         "环境检查",
     );
 
-    if detected_codex.is_none() || !companion_installed {
+    if detected_codex.is_none() || !companion_installed || !visual_cpp_runtime_installed() {
         fs::create_dir_all(&cache_dir).context("无法创建下载缓存目录")?;
     }
 
@@ -569,6 +1052,44 @@ async fn perform_installation(
     };
 
     ensure_active(control, run_id)?;
+    if visual_cpp_runtime_installed() {
+        emit_progress(
+            app,
+            run_id,
+            62,
+            "skip",
+            "检测到 Microsoft Visual C++ 运行库",
+            "已确认系统依赖存在，跳过重复安装",
+            "系统依赖",
+        );
+    } else {
+        emit_progress(
+            app,
+            run_id,
+            59,
+            "download",
+            "正在下载 Microsoft Visual C++ 运行库",
+            "从 Microsoft 官方下载服务获取系统组件",
+            "系统依赖",
+        );
+        let runtime_asset = visual_cpp_runtime_asset()?;
+        let runtime_path = cache_dir.join(&runtime_asset.name);
+        download_asset(
+            app,
+            control,
+            run_id,
+            &client,
+            &runtime_asset,
+            &runtime_path,
+            59,
+            60,
+            "系统依赖",
+        )
+        .await?;
+        install_visual_cpp_runtime(app, control, run_id, &runtime_path).await?;
+    }
+
+    ensure_active(control, run_id)?;
     if companion_installed {
         emit_progress(
             app,
@@ -589,9 +1110,8 @@ async fn perform_installation(
             "选择适用于 Windows 的官方安装包",
             companion_name,
         );
-        let companion_release = latest_release(&client, companion_repo).await?;
+        let companion_asset = latest_companion_asset(&client, &request.companion).await?;
         ensure_active(control, run_id)?;
-        let companion_asset = choose_companion_asset(&companion_release, companion_name)?;
         let companion_path = cache_dir.join(&companion_asset.name);
         download_asset(
             app,
@@ -749,28 +1269,135 @@ fn open_external(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[cfg(windows)]
 fn copy_qq() -> Result<(), String> {
-    let mut child = Command::new("clip.exe")
-        .stdin(Stdio::piped())
+    use std::ptr::null_mut;
+    use std::thread;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    let mut opened = false;
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            opened = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !opened {
+        return Err(format!(
+            "无法访问系统剪贴板：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let _clipboard = ClipboardGuard;
+
+    if unsafe { EmptyClipboard() } == 0 {
+        return Err(format!(
+            "无法清空系统剪贴板：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let wide_text: Vec<u16> = QQ_NUMBER.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = wide_text.len() * std::mem::size_of::<u16>();
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
+    if memory.is_null() {
+        return Err(format!(
+            "无法分配剪贴板内存：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let destination = unsafe { GlobalLock(memory) };
+    if destination.is_null() {
+        unsafe {
+            GlobalFree(memory);
+        }
+        return Err(format!(
+            "无法写入系统剪贴板：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            wide_text.as_ptr(),
+            destination.cast::<u16>(),
+            wide_text.len(),
+        );
+        GlobalUnlock(memory);
+    }
+
+    if unsafe { SetClipboardData(CF_UNICODETEXT, memory) }.is_null() {
+        unsafe {
+            GlobalFree(memory);
+        }
+        return Err(format!(
+            "复制 QQ 号失败：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+#[cfg(not(windows))]
+fn copy_qq() -> Result<(), String> {
+    Err("当前系统暂不支持自动复制 QQ 号".to_string())
+}
+
+fn launch_executable(path: &Path, label: &str) -> Result<(), String> {
+    match Command::new(path).spawn() {
+        Ok(_) => Ok(()),
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(740) => launch_elevated(path, label),
+        Err(error) => Err(format!("无法启动 {label}：{error}")),
+    }
+}
+
+#[cfg(windows)]
+fn launch_elevated(path: &Path, label: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Start-Process -FilePath $env:CODEX_LAUNCH_TARGET -Verb RunAs",
+        ])
+        .env("CODEX_LAUNCH_TARGET", path)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "无法写入系统剪贴板".to_string())?;
-    stdin
-        .write_all(QQ_NUMBER.as_bytes())
-        .map_err(|error| format!("复制 QQ 号失败：{error}"))?;
-    drop(stdin);
-    let status = child
-        .wait()
-        .map_err(|error| format!("复制 QQ 号失败：{error}"))?;
+        .status()
+        .map_err(|error| format!("无法请求管理员权限启动 {label}：{error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err("复制 QQ 号失败".to_string())
+        Err(format!("{label} 需要管理员权限，权限确认已取消"))
     }
 }
 
@@ -778,10 +1405,7 @@ fn copy_qq() -> Result<(), String> {
 fn launch_installed_app(target: String) -> Result<(), String> {
     if target == "codex" {
         return match detect_codex_desktop() {
-            Some(CodexDesktopInstallation::Executable(path)) => Command::new(&path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|error| format!("无法启动 Codex：{error}")),
+            Some(CodexDesktopInstallation::Executable(path)) => launch_executable(&path, "Codex"),
             Some(CodexDesktopInstallation::MicrosoftStore) => Command::new("explorer.exe")
                 .arg("shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App")
                 .spawn()
@@ -813,10 +1437,7 @@ fn launch_installed_app(target: String) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("没有找到 {label}，请先完成安装"));
     }
-    Command::new(&path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("无法启动 {label}：{error}"))
+    launch_executable(&path, label)
 }
 
 pub fn run() {
@@ -825,6 +1446,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             install_components,
             cancel_installation,
+            check_app_update,
+            install_app_update,
             open_external,
             copy_qq,
             launch_installed_app
@@ -856,5 +1479,111 @@ mod tests {
         assert!(selected
             .browser_download_url
             .starts_with("https://persistent.oaistatic.com/codex-app-prod/"));
+    }
+
+    #[test]
+    fn codex_plus_plus_uses_official_metadata_after_asset_rename() {
+        let url = "https://example.test/downloads/renamed-installer.exe";
+        let update = CodexPlusPlusUpdate {
+            version: "v-next".to_string(),
+            assets: vec![PublishedAsset {
+                name: "renamed-installer.exe".to_string(),
+                url: url.to_string(),
+            }],
+        };
+        let release = Release {
+            _tag_name: "v-next".to_string(),
+            assets: vec![ReleaseAsset {
+                name: "renamed-installer.exe".to_string(),
+                browser_download_url: url.to_string(),
+                digest: Some("sha256:abc".to_string()),
+            }],
+        };
+
+        let selected = choose_codex_plus_plus_asset(&update, &release, "x86_64").unwrap();
+        assert_eq!(selected.browser_download_url, url);
+        assert_eq!(selected.digest.as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn cc_switch_uses_platform_mapping_without_x64_in_filename() {
+        let url = "https://example.test/downloads/CC-Switch-Windows.msi";
+        let update = CcSwitchUpdate {
+            version: "3.19.2".to_string(),
+            platforms: HashMap::from([(
+                "windows-x86_64".to_string(),
+                PublishedPlatform {
+                    url: url.to_string(),
+                },
+            )]),
+        };
+        let release = Release {
+            _tag_name: "v3.19.2".to_string(),
+            assets: vec![ReleaseAsset {
+                name: "CC-Switch-Windows.msi".to_string(),
+                browser_download_url: url.to_string(),
+                digest: Some("sha256:def".to_string()),
+            }],
+        };
+
+        let selected = choose_cc_switch_asset(&update, &release, "x86_64").unwrap();
+        assert_eq!(selected.name, "CC-Switch-Windows.msi");
+        assert_eq!(selected.digest.as_deref(), Some("sha256:def"));
+    }
+
+    #[test]
+    fn visual_cpp_runtime_asset_uses_microsoft_official_download() {
+        let asset = visual_cpp_runtime_asset().unwrap();
+        assert!(asset
+            .browser_download_url
+            .starts_with("https://aka.ms/vs/17/release/"));
+        assert!(asset.name.starts_with("vc_redist."));
+    }
+
+    #[test]
+    fn app_update_selects_setup_for_current_architecture() {
+        let release = AppRelease {
+            tag_name: "v0.2.0".to_string(),
+            body: "notes".to_string(),
+            html_url: "https://github.com/abellee/codex_installer/releases/tag/v0.2.0"
+                .to_string(),
+            assets: vec![
+                AppReleaseAsset {
+                    name: "Codex.Setup_0.2.0_arm64-setup.exe".to_string(),
+                    browser_download_url: "https://example.test/arm64.exe".to_string(),
+                    digest: None,
+                },
+                AppReleaseAsset {
+                    name: "Codex.Setup_0.2.0_x64-setup.exe".to_string(),
+                    browser_download_url: "https://example.test/x64.exe".to_string(),
+                    digest: Some("sha256:abc".to_string()),
+                },
+            ],
+        };
+
+        let selected = choose_app_update_asset(&release, "x86_64").unwrap();
+        assert!(selected.name.contains("x64-setup.exe"));
+        assert_eq!(selected.digest.as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn app_update_only_accepts_newer_semantic_versions() {
+        assert!(is_newer_version("0.1.0", "v0.2.0").unwrap());
+        assert!(!is_newer_version("0.2.0", "v0.2.0").unwrap());
+        assert!(!is_newer_version("0.3.0", "v0.2.0").unwrap());
+    }
+
+    #[test]
+    fn no_release_means_current_version_is_latest() {
+        let update = current_app_update();
+        assert!(!update.available);
+        assert_eq!(update.current_version, update.latest_version);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevation_required_is_windows_error_740() {
+        let error = std::io::Error::from_raw_os_error(740);
+        assert_eq!(error.raw_os_error(), Some(740));
     }
 }

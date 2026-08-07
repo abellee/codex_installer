@@ -10,7 +10,7 @@
 
 [MIT License](LICENSE) · [问题反馈](https://github.com/abellee/codex_installer/issues) · 安装支持 QQ：`751077517`
 
-> 当前状态：Windows 版本正在测试，macOS 版本尚在适配。请在正式发布前从本仓库的 [Releases](https://github.com/abellee/codex_installer/releases) 页面获取安装包，不要使用来源不明的转载文件。
+> 当前状态：Windows x64 版本已提供公开测试版，macOS 版本尚在适配。请只从本仓库的 [Releases](https://github.com/abellee/codex_installer/releases) 页面下载安装包，不要使用来源不明的转载文件。
 
 ## 功能
 
@@ -22,7 +22,10 @@
 - 安装完成后可直接启动 Codex 和所选配置工具。
 - 内置带标注截图的 Codex++、CC Switch 配置教程。
 - 教程图片支持全屏查看、缩放、拖动和左右切换。
-- 安装遇到问题时，可以一键复制支持 QQ 号码。
+- 安装遇到问题时，点击顶部入口即可快速复制支持 QQ，并立即显示确认弹窗。
+- 启动应用时按钮会进入加载状态，避免连续点击造成重复启动。
+- 启动后自动静默检查新版本，也可以通过顶部“检查更新”手动检查、查看更新说明并一键安装。
+- 下载会遵循 Windows 系统代理设置，已开启系统代理的用户无需在安装器中重复配置。
 
 ## 组件区别
 
@@ -46,7 +49,7 @@ Codex 桌面版会自动包含在安装流程中，用户只需在 Codex++ 和 C
 
 | 平台 | 状态 | 说明 |
 | --- | --- | --- |
-| Windows x64 | 测试中 | 支持真实检测、下载、安装和启动 |
+| Windows x64 | 公开测试 | 支持真实检测、下载、安装、启动和应用更新 |
 | Windows ARM64 | 适配中 | Codex 官方 MSIX 已支持，配置工具安装流程仍需实机验证 |
 | macOS | 计划支持 | 当前仅能运行模拟流程，不能用于真实安装 |
 
@@ -56,7 +59,7 @@ Codex 桌面版会自动包含在安装流程中，用户只需在 Codex++ 和 C
 
 1. 打开项目的 [Releases](https://github.com/abellee/codex_installer/releases) 页面。
 2. 下载最新的 Windows 安装包。
-3. 完成安装后启动 **Codex Setup**。
+3. 完成安装后启动 **Codex Installer**。
 4. 如果 Windows 显示安全提醒，请先核对文件来源确实是本仓库的 Release，再继续运行。
 
 ### 2. 选择配置工具
@@ -89,6 +92,15 @@ Codex 桌面版会自动包含在安装流程中，用户只需在 Codex++ 和 C
 - 打开所选工具的配置教程。
 
 [![Codex Installer 安装完成界面](docs/images/app-complete.png)](docs/images/app-complete.png)
+
+### 4. 检查安装器更新
+
+Codex Installer 启动后会在后台静默检查本项目最新的 GitHub Release。也可以点击窗口右上角的“检查更新”手动检查：
+
+1. 有新版本时，弹窗会显示当前版本、最新版本和发布说明。
+2. 点击“下载并安装”后，可以在弹窗中查看实时下载进度。
+3. 下载完成后会校验 GitHub 提供的 SHA-256 摘要（如果该 Release 提供摘要），随后退出当前版本并启动新版安装程序。
+4. 更新包只接受本仓库 GitHub Release 下、与当前 Windows CPU 架构匹配的安装程序。
 
 ## Codex++ 配置教程
 
@@ -156,7 +168,8 @@ npm run tauri dev
 
 ```powershell
 npm run build
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --features custom-protocol
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features custom-protocol -- -D warnings
 ```
 
 ### 构建安装包
@@ -195,7 +208,11 @@ Codex 桌面版安装包体积较大，具体耗时取决于网络速度。请�
 
 ### 安装失败后如何反馈？
 
-保留失败页面显示的错误信息，点击界面左上角的 QQ 号码进行复制，然后通过 QQ `751077517` 联系维护者。
+保留失败页面显示的错误信息，点击界面左上角的“安装遇到问题？”；弹窗确认复制成功后，通过 QQ `751077517` 联系维护者。
+
+### 安装器如何更新？
+
+点击窗口右上角的“检查更新”。如果有新版本，可以直接查看更新说明、下载安装包并启动更新。安装器不会从第三方镜像下载自身更新，只接受本仓库 GitHub Release 中的 Windows 安装包。
 
 ### 可以在 macOS 上真实安装吗？
 
